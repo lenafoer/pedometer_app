@@ -76,9 +76,9 @@ class PedometerService {
       return;
     }
 
-    // Start periodic refresh every 30 seconds to update steps even if stream is delayed
+    // Start periodic refresh every 1 second to actively poll for step updates
     _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 30), (timer) async {
+    _refreshTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
       if (_lastDeviceSteps > 0) {
         await _processStepCount(_lastDeviceSteps, onStepUpdate);
       }

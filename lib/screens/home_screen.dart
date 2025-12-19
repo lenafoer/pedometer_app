@@ -10,7 +10,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final PedometerService _pedometerService = PedometerService();
   final StorageService _storageService = StorageService();
 
@@ -24,7 +24,17 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initializePedometer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.resumed) {
+      // App came to foreground, refresh steps immediately
+      _refreshSteps();
+    }
   }
 
   Future<void> _initializePedometer() async {
@@ -89,6 +99,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pedometerService.dispose();
     super.dispose();
   }
@@ -99,11 +110,6 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Simple Pedometer'),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _refreshSteps,
-            tooltip: 'Refresh steps',
-          ),
           IconButton(
             icon: const Icon(Icons.bar_chart),
             onPressed: () {
