@@ -1,24 +1,28 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:pedometer/pedometer.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../models/step_data.dart';
-import 'storage_service.dart';
+import 'database_service.dart';
 
 class PedometerService {
-  final StorageService _storageService = StorageService();
+  static const platform = MethodChannel('com.example.pedometer_app/step_service');
+  static const eventChannel = EventChannel('com.example.pedometer_app/step_events');
 
-  Stream<StepCount>? _stepCountStream;
-  Stream<PedestrianStatus>? _pedestrianStatusStream;
-  StreamSubscription<StepCount>? _stepCountSubscription;
-  Timer? _refreshTimer;
+  final DatabaseService _databaseService = DatabaseService();
 
-  int _initialSteps = 0;
+  StreamSubscription<dynamic>? _eventSubscription;
+
+  int _baselineSteps = 0;
   int _todaySteps = 0;
-  int _lastDeviceSteps = 0;
+  int _lastCumulativeSteps = 0;
+  int _lastValidSteps = 0;
+  DateTime? _lastUpdateTime;
+
   bool _isInitialized = false;
   Function(int)? _onStepUpdateCallback;
+  Function(String)? _onStatusUpdateCallback;
 
   String _status = 'Unknown';
   String get status => _status;
@@ -29,16 +33,52 @@ class PedometerService {
     return Platform.isAndroid || Platform.isIOS;
   }
 
-  Future<bool> requestPermission() async {
+  Future<bool> requestPermissions() async {
     if (!isPlatformSupported) {
-      return true;
+      return false;
     }
 
     try {
-      final status = await Permission.activityRecognition.request();
+      // Request activity recognition permission
+      var status = await Permission.activityRecognition.status;
+
+      if (status.isDenied) {
+        status = await Permission.activityRecognition.request();
+      }
+
+      if (!status.isGranted) {
+        return false;
+      }
+
+      // For Android 13+, also need notification permission for foreground service
+      if (Platform.isAndroid) {
+        var notificationStatus = await Permission.notification.status;
+        if (notificationStatus.isDenied) {
+          await Permission.notification.request();
+        }
+      }
+
       return status.isGranted;
     } catch (e) {
-      return true;
+      debugPrint('Permission request error: $e');
+      return false;
+    }
+  }
+
+  Future<bool> isSensorAvailable() async {
+    if (!isPlatformSupported) {
+      return false;
+    }
+
+    try {
+      if (Platform.isAndroid) {
+        final bool available = await platform.invokeMethod('isSensorAvailable');
+        return available;
+      }
+      return true; // iOS CoreMotion is generally available
+    } catch (e) {
+      debugPrint('Sensor availability check error: $e');
+      return false;
     }
   }
 
@@ -50,131 +90,163 @@ class PedometerService {
       return;
     }
 
-    final hasPermission = await requestPermission();
+    // Check sensor availability first
+    final sensorAvailable = await isSensorAvailable();
+    if (!sensorAvailable) {
+      throw Exception('Step counter sensor not available on this device');
+    }
+
+    // Request permissions
+    final hasPermission = await requestPermissions();
     if (!hasPermission) {
       throw Exception('Activity recognition permission not granted');
     }
 
-    // Load saved baseline from when app was last used
-    final savedBaseline = await _storageService.getTotalSteps();
-    if (savedBaseline > 0) {
-      _initialSteps = savedBaseline;
-    }
-
-    _stepCountStream = Pedometer.stepCountStream;
-    _pedestrianStatusStream = Pedometer.pedestrianStatusStream;
+    // Load baseline from database
+    await _loadBaselineFromDatabase();
 
     _isInitialized = true;
   }
 
-  void startListening(Function(int) onStepUpdate, Function(String) onError) {
+  Future<void> _loadBaselineFromDatabase() async {
+    final dateKey = _databaseService.getDateKey(DateTime.now());
+
+    // Get first snapshot of today to establish baseline
+    final firstSnapshot = await _databaseService.getFirstSnapshotOfDay(dateKey);
+
+    if (firstSnapshot != null) {
+      _baselineSteps = firstSnapshot['cumulative_steps'] as int;
+      debugPrint('Loaded baseline from database: $_baselineSteps');
+    }
+
+    // Get latest snapshot to restore current state
+    final latestSnapshot = await _databaseService.getLatestSnapshotOfDay(dateKey);
+
+    if (latestSnapshot != null) {
+      _todaySteps = latestSnapshot['daily_steps'] as int;
+      _lastCumulativeSteps = latestSnapshot['cumulative_steps'] as int;
+      debugPrint('Restored state - Today: $_todaySteps, Last cumulative: $_lastCumulativeSteps');
+    }
+  }
+
+  Future<void> startListening(
+    Function(int) onStepUpdate,
+    Function(String) onError,
+    Function(String)? onStatusUpdate,
+  ) async {
     _onStepUpdateCallback = onStepUpdate;
+    _onStatusUpdateCallback = onStatusUpdate;
 
     if (!isPlatformSupported) {
       _status = 'Unsupported Platform';
-      onError('Step counting is only supported on Android and iOS devices. You can still manually add steps for testing.');
+      onError('Step counting is only supported on Android and iOS devices.');
       return;
     }
 
-    // Start periodic refresh every 1 second to actively poll for step updates
-    _refreshTimer?.cancel();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-      if (_lastDeviceSteps > 0) {
-        await _processStepCount(_lastDeviceSteps, onStepUpdate);
+    try {
+      // Start foreground service on Android
+      if (Platform.isAndroid) {
+        await platform.invokeMethod('startService');
+        _updateStatus('Service Started');
       }
-    });
 
-    _pedestrianStatusStream?.listen(
-      (PedestrianStatus event) {
-        _status = event.status;
-      },
-      onError: (error) {
-        _status = 'Stopped';
-        onError('Pedestrian Status Error: $error');
-      },
-    );
+      // Listen to step events from native side
+      _eventSubscription = eventChannel.receiveBroadcastStream().listen(
+        (dynamic event) async {
+          if (event is Map) {
+            final steps = (event['steps'] as num).toInt();
+            await _processStepCount(steps, onStepUpdate);
+          }
+        },
+        onError: (error) {
+          debugPrint('Step event error: $error');
+          onError('Step Count Error: $error');
+        },
+      );
 
-    _stepCountSubscription = _stepCountStream?.listen(
-      (StepCount event) async {
-        _lastDeviceSteps = event.steps;
-        await _processStepCount(event.steps, onStepUpdate);
-      },
-      onError: (error) {
-        onError('Step Count Error: $error');
-      },
-    );
+      debugPrint('Started listening for step events');
+    } catch (e) {
+      debugPrint('Failed to start listening: $e');
+      onError('Failed to start step counting: $e');
+    }
   }
 
-  Future<void> _processStepCount(int currentDeviceSteps, Function(int) onStepUpdate) async {
-    // Check if it's a new day - reset baseline if needed
-    final isNewDay = await _storageService.isNewDay();
-    if (isNewDay && _initialSteps != 0) {
-      // New day detected - reset baseline to current device steps
-      _initialSteps = currentDeviceSteps;
+  Future<void> _processStepCount(int currentCumulativeSteps, Function(int) onStepUpdate) async {
+    debugPrint('Processing step count: $currentCumulativeSteps');
+
+    // Check if it's a new day
+    final dateKey = _databaseService.getDateKey(DateTime.now());
+    final firstSnapshot = await _databaseService.getFirstSnapshotOfDay(dateKey);
+
+    if (firstSnapshot == null) {
+      // First reading of the day - set baseline
+      _baselineSteps = currentCumulativeSteps;
       _todaySteps = 0;
-      await _storageService.saveTotalSteps(_initialSteps);
-      await _updateTodayData(0);
+      _lastCumulativeSteps = currentCumulativeSteps;
+      debugPrint('First reading of day - baseline set to: $_baselineSteps');
+
+      await _saveSnapshot(currentCumulativeSteps, 0);
       onStepUpdate(0);
       return;
     }
 
-    // First time setup - save the device's current step count as baseline
-    if (_initialSteps == 0) {
-      final todayData = await _storageService.getTodayStepData();
-      if (todayData != null && todayData.steps > 0 && !isNewDay) {
-        // App was opened before today, calculate baseline from saved data
-        _initialSteps = currentDeviceSteps - todayData.steps;
-      } else {
-        // First time today, use current device steps as baseline
-        _initialSteps = currentDeviceSteps;
+    // Handle device reboot (cumulative steps decreased)
+    if (currentCumulativeSteps < _lastCumulativeSteps) {
+      debugPrint('Device reboot detected - resetting baseline');
+      // Keep today's steps, just adjust baseline
+      _baselineSteps = currentCumulativeSteps - _todaySteps;
+      if (_baselineSteps < 0) {
+        _baselineSteps = 0;
+        _todaySteps = currentCumulativeSteps;
       }
-      await _storageService.saveTotalSteps(_initialSteps);
+    } else {
+      // Normal update - calculate today's steps
+      _todaySteps = currentCumulativeSteps - _baselineSteps;
     }
 
-    // Calculate today's steps
-    _todaySteps = currentDeviceSteps - _initialSteps;
+    // Validate step increase is reasonable
+    if (_lastUpdateTime != null && _lastValidSteps > 0) {
+      final timeDiff = DateTime.now().difference(_lastUpdateTime!).inSeconds;
+      final stepDiff = _todaySteps - _lastValidSteps;
 
-    // Handle device reboot (step count resets to 0)
-    if (_todaySteps < 0 || currentDeviceSteps < _initialSteps) {
-      // Get today's saved total and add to it
-      final todayData = await _storageService.getTodayStepData();
-      if (todayData != null && todayData.steps > 0) {
-        _initialSteps = currentDeviceSteps - todayData.steps;
-      } else {
-        _initialSteps = currentDeviceSteps;
+      if (timeDiff > 0 && stepDiff > 0) {
+        final stepsPerMinute = (stepDiff / timeDiff) * 60;
+
+        // Maximum realistic walking speed is ~200 steps/minute
+        if (stepsPerMinute > 250) {
+          debugPrint('Suspicious step increase detected: $stepsPerMinute steps/min - ignoring');
+          return;
+        }
       }
-      _todaySteps = currentDeviceSteps - _initialSteps;
-      if (_todaySteps < 0) _todaySteps = 0;
-      await _storageService.saveTotalSteps(_initialSteps);
     }
 
-    await _updateTodayData(_todaySteps);
+    _lastCumulativeSteps = currentCumulativeSteps;
+    _lastValidSteps = _todaySteps;
+    _lastUpdateTime = DateTime.now();
+
+    await _saveSnapshot(currentCumulativeSteps, _todaySteps);
     onStepUpdate(_todaySteps);
+
+    _updateStatus('Walking');
   }
 
-  Future<void> refreshSteps() async {
-    if (_onStepUpdateCallback != null && _lastDeviceSteps > 0) {
-      await _processStepCount(_lastDeviceSteps, _onStepUpdateCallback!);
-    }
-  }
+  Future<void> _saveSnapshot(int cumulativeSteps, int dailySteps) async {
+    final distance = _calculateDistance(dailySteps);
+    final calories = _calculateCalories(dailySteps);
+    final dateKey = _databaseService.getDateKey(DateTime.now());
 
-  Future<void> addManualSteps(int steps) async {
-    _todaySteps += steps;
-    await _updateTodayData(_todaySteps);
-  }
-
-  Future<void> _updateTodayData(int steps) async {
-    final distance = _calculateDistance(steps);
-    final calories = _calculateCalories(steps);
-
-    final stepData = StepData(
-      date: DateTime.now(),
-      steps: steps,
+    await _databaseService.insertSnapshot(
+      cumulativeSteps: cumulativeSteps,
+      dailySteps: dailySteps,
       distance: distance,
       calories: calories,
+      dateKey: dateKey,
     );
+  }
 
-    await _storageService.saveStepData(stepData);
+  void _updateStatus(String newStatus) {
+    _status = newStatus;
+    _onStatusUpdateCallback?.call(newStatus);
   }
 
   double _calculateDistance(int steps) {
@@ -187,15 +259,30 @@ class PedometerService {
     return (steps * caloriesPerStep).round();
   }
 
-  Future<void> resetDailySteps() async {
-    final currentTotal = await _storageService.getTotalSteps();
-    _initialSteps = currentTotal + _todaySteps;
-    await _storageService.saveTotalSteps(_initialSteps);
-    _todaySteps = 0;
+  Future<void> addManualSteps(int steps) async {
+    _todaySteps += steps;
+    await _saveSnapshot(_lastCumulativeSteps, _todaySteps);
+    _onStepUpdateCallback?.call(_todaySteps);
+  }
+
+  Future<List<StepData>> getHistory() async {
+    return await _databaseService.getDailyHistory();
+  }
+
+  Future<void> cleanupOldData() async {
+    await _databaseService.clearOldSnapshots(daysToKeep: 30);
   }
 
   void dispose() {
-    _stepCountSubscription?.cancel();
-    _refreshTimer?.cancel();
+    _eventSubscription?.cancel();
+
+    // Stop foreground service
+    if (Platform.isAndroid) {
+      try {
+        platform.invokeMethod('stopService');
+      } catch (e) {
+        debugPrint('Error stopping service: $e');
+      }
+    }
   }
 }

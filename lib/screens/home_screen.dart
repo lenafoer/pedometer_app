@@ -57,6 +57,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _errorMessage = error;
           });
         },
+        (status) {
+          // Status updates from service
+        },
       );
 
       final todayData = await _storageService.getTodayStepData();
@@ -94,7 +97,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _refreshSteps() async {
-    await _pedometerService.refreshSteps();
+    // Steps are automatically updated via event stream
+    // Load latest data from storage
+    final todayData = await _storageService.getTodayStepData();
+    if (todayData != null) {
+      setState(() {
+        _steps = todayData.steps;
+        _distance = todayData.distance;
+        _calories = todayData.calories;
+        _walkingMinutes = _calculateWalkingTime(todayData.steps);
+      });
+    }
   }
 
   @override

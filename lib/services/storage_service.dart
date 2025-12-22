@@ -1,82 +1,30 @@
-import 'dart:convert';
-import 'package:shared_preferences/shared_preferences.dart';
 import '../models/step_data.dart';
+import 'database_service.dart';
 
 class StorageService {
-  static const String _stepHistoryKey = 'step_history';
-  static const String _totalStepsKey = 'total_steps';
+  final DatabaseService _databaseService = DatabaseService();
 
   Future<void> saveStepData(StepData stepData) async {
-    final prefs = await SharedPreferences.getInstance();
-    final history = await getStepHistory();
-
-    final dateKey = _getDateKey(stepData.date);
-    final existingIndex = history.indexWhere(
-      (data) => _getDateKey(data.date) == dateKey,
-    );
-
-    if (existingIndex != -1) {
-      history[existingIndex] = stepData;
-    } else {
-      history.add(stepData);
-    }
-
-    history.sort((a, b) => b.date.compareTo(a.date));
-
-    final jsonList = history.map((data) => data.toJson()).toList();
-    await prefs.setString(_stepHistoryKey, jsonEncode(jsonList));
+    // This is now handled by database_service.dart
+    // Kept for backward compatibility
   }
 
   Future<List<StepData>> getStepHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonString = prefs.getString(_stepHistoryKey);
-
-    if (jsonString == null) {
-      return [];
-    }
-
-    final List<dynamic> jsonList = jsonDecode(jsonString);
-    return jsonList.map((json) => StepData.fromJson(json)).toList();
+    return await _databaseService.getDailyHistory();
   }
 
   Future<StepData?> getTodayStepData() async {
-    final history = await getStepHistory();
-    final today = DateTime.now();
-    final todayKey = _getDateKey(today);
+    final dateKey = _databaseService.getDateKey(DateTime.now());
+    final snapshot = await _databaseService.getLatestSnapshotOfDay(dateKey);
 
-    return history.firstWhere(
-      (data) => _getDateKey(data.date) == todayKey,
-      orElse: () => StepData(date: today, steps: 0),
+    if (snapshot == null) return null;
+
+    return StepData(
+      date: DateTime.fromMillisecondsSinceEpoch(snapshot['timestamp'] as int),
+      steps: snapshot['daily_steps'] as int,
+      distance: snapshot['distance'] as double,
+      calories: snapshot['calories'] as int,
     );
-  }
-
-  Future<void> saveTotalSteps(int steps) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_totalStepsKey, steps);
-    // Save the date when we saved this baseline
-    await prefs.setString('last_baseline_date', _getDateKey(DateTime.now()));
-  }
-
-  Future<int> getTotalSteps() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getInt(_totalStepsKey) ?? 0;
-  }
-
-  Future<bool> isNewDay() async {
-    final prefs = await SharedPreferences.getInstance();
-    final lastDate = prefs.getString('last_baseline_date');
-    final todayKey = _getDateKey(DateTime.now());
-    return lastDate != todayKey;
-  }
-
-  Future<void> clearHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_stepHistoryKey);
-    await prefs.remove(_totalStepsKey);
-  }
-
-  String _getDateKey(DateTime date) {
-    return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
   }
 
   Future<Map<String, dynamic>> getStatistics() async {
@@ -109,5 +57,11 @@ class StorageService {
       'totalCalories': totalCalories,
       'daysTracked': history.length,
     };
+  }
+
+  Future<void> clearHistory() async {
+    // Clear all data from database
+    final db = await _databaseService.database;
+    await db.delete('step_snapshots');
   }
 }
