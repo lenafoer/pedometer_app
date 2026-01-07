@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import '../services/pedometer_service.dart';
 import '../services/storage_service.dart';
+import '../services/battery_optimization_service.dart';
 import 'stats_screen.dart';
+import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -20,12 +22,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _walkingMinutes = 0;
   String _errorMessage = '';
   DateTime? _firstStepTime;
+  bool _showBatteryOptimizationWarning = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initializePedometer();
+    _checkBatteryOptimization();
+  }
+
+  Future<void> _checkBatteryOptimization() async {
+    final isEnabled = await BatteryOptimizationService.isBatteryOptimizationEnabled();
+    setState(() {
+      _showBatteryOptimizationWarning = isEnabled;
+    });
   }
 
   @override
@@ -132,10 +143,50 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               );
             },
           ),
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () async {
+              await Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const SettingsScreen()),
+              );
+              // Recheck battery optimization after returning from settings
+              _checkBatteryOptimization();
+            },
+          ),
         ],
       ),
       body: Column(
         children: [
+          if (_showBatteryOptimizationWarning)
+            Container(
+              padding: const EdgeInsets.all(12),
+              color: Colors.orange.shade100,
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber, color: Colors.orange.shade700, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Battery optimization may stop step counting. Tap settings to fix.',
+                      style: TextStyle(color: Colors.orange.shade900, fontSize: 12),
+                    ),
+                  ),
+                  IconButton(
+                    icon: Icon(Icons.settings, color: Colors.orange.shade700, size: 20),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () async {
+                      await Navigator.push(
+                        context,
+                        MaterialPageRoute(builder: (context) => const SettingsScreen()),
+                      );
+                      _checkBatteryOptimization();
+                    },
+                  ),
+                ],
+              ),
+            ),
           if (_errorMessage.isNotEmpty)
             Container(
               padding: const EdgeInsets.all(12),

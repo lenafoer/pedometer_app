@@ -61,6 +61,9 @@ class MainActivity : FlutterActivity() {
         } else {
             startService(intent)
         }
+
+        // Schedule the watchdog to check service health every 15 minutes
+        ServiceWatchdogReceiver.scheduleWatchdog(this)
     }
 
     private fun stopStepCounterService() {

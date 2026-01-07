@@ -49,7 +49,19 @@ class StepCounterService : Service(), SensorEventListener {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Service onStartCommand: ${intent?.action}")
 
-        when (intent?.action) {
+        // Handle service restart after being killed by system (intent will be null)
+        if (intent == null) {
+            Log.w(TAG, "Service restarted by system with null intent - restoring state")
+            if (!isRunning) {
+                startForeground(NOTIFICATION_ID, createNotification())
+                registerSensorListener()
+                isRunning = true
+                isServiceRunning = true
+            }
+            return START_STICKY
+        }
+
+        when (intent.action) {
             ACTION_START -> {
                 if (!isRunning) {
                     startForeground(NOTIFICATION_ID, createNotification())
@@ -60,6 +72,16 @@ class StepCounterService : Service(), SensorEventListener {
             }
             ACTION_STOP -> {
                 stopSelf()
+            }
+            else -> {
+                // Handle unknown actions by ensuring service is running
+                Log.w(TAG, "Unknown action: ${intent.action} - ensuring service is running")
+                if (!isRunning) {
+                    startForeground(NOTIFICATION_ID, createNotification())
+                    registerSensorListener()
+                    isRunning = true
+                    isServiceRunning = true
+                }
             }
         }
 
